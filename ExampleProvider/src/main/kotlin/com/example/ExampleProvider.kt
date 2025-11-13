@@ -1,21 +1,178 @@
-package com.example
+// In repository -> WeCima/WeCimaProvider.kt
+package com.lagradost.cloudstream3.ar
 
-import com.lagradost.cloudstream3.MainAPI
-import com.lagradost.cloudstream3.SearchResponse
-import com.lagradost.cloudstream3.TvType
+import com.lagradost.cloudstream3.*
+import com.lagradost.cloudstream3.utils.*
+import org.jsoup.nodes.Element
+import com.lagradost.cloudstream3.network.post
+import com.fasterxml.jackson.annotation.JsonProperty
+import android.util.Base64
 
-class ExampleProvider : MainAPI() { // All providers must be an instance of MainAPI
-    override var mainUrl = "https://example.com/" 
-    override var name = "Example provider"
-    override val supportedTypes = setOf(TvType.Movie)
-
-    override var lang = "en"
-
-    // Enable this when your provider has a main page
+class WecimaProvider : MainAPI() {
+    override var mainUrl = "https://wecima.ac"
+    override var name = "We Cima"
     override val hasMainPage = true
+    override var lang = "ar"
+    override val supportedTypes = setOf(
+        TvType.Movie,
+        TvType.TvSeries
+    )
 
-    // This function gets called when you search for something
+    override val mainPage = mainPageOf(
+        "$mainUrl/seriestv" to "أحدث المسلسلات",
+        "$mainUrl/movies" to "أحدث الأفلام",
+        "$mainUrl/category/arabic-movies" to "أفلام عربي",
+        "$mainUrl/category/foreign-movies" to "أفلام أجنبي",
+        "$mainUrl/category/arabic-series" to "مسلسلات عربية",
+        "$mainUrl/category/foreign-series" to "مسلسلات أجنبية"
+    )
+
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        val document = app.get(request.data).document
+        val home = document.select("div.Grid--WecimaPosts div.GridItem").mapNotNull {
+            it.toSearchResult()
+        }
+        return newHomePageResponse(request.name, home)
+    }
+
+    private fun Element.toSearchResult(): SearchResponse? {
+        val titleElement = this.selectFirst("h2") ?: this.selectFirst("strong") ?: return null
+        val title = titleElement.text().trim()
+        val href = this.selectFirst("a")?.attr("href") ?: return null
+        val posterUrl = this.selectFirst("span.BG--GridItem")?.let {
+            val style = it.attr("style")
+            // --image:url(XXX)
+            Regex("url\\((.*?)\\)").find(style)?.groupValues?.get(1)
+        } ?: this.selectFirst("span.BG--GridItem")?.attr("data-src")
+
+        return if (href.contains("/series/")) {
+            newTvSeriesSearchResponse(title, href, TvType.TvSeries) {
+                this.posterUrl = posterUrl
+            }
+        } else {
+            newMovieSearchResponse(title, href, TvType.Movie) {
+                this.posterUrl = posterUrl
+            }
+        }
+    }
+
     override suspend fun search(query: String): List<SearchResponse> {
-        return listOf()
+        val url = "$mainUrl/search"
+        val response = app.post(
+            url,
+            data = mapOf("q" to query),
+            referer = "$mainUrl/"
+        ).parsed<SearchRoot>()
+        
+        val html = response.output.joinToString("")
+        val document = org.jsoup.Jsoup.parse(html)
+        
+        return document.select("div.GridItem").mapNotNull {
+            it.toSearchResult()
+        }
+    }
+    
+    data class SearchRoot (
+        @JsonProperty("output" ) val output : ArrayList<String> = arrayListOf()
+    )
+
+    override suspend fun load(url: String): LoadResponse {
+        val document = app.get(url).document
+
+        val title = document.selectFirst("div.Title--Content--Single-begin h1")?.text()?.trim() ?: ""
+        val posterStyle = document.selectFirst("wecima.separated--top")?.attr("style")
+        val posterUrl = Regex("url\\((.*?)\\)").find(posterStyle ?: "")?.groupValues?.get(1)
+        val plot = document.selectFirst("div.StoryMovieContent")?.text()?.trim()
+        val year = document.select("ul.Terms--Content--Single-begin li")
+            .find { it.selectFirst("span")?.text()?.contains("السنة") == true }
+            ?.selectFirst("p")?.text()?.toIntOrNull()
+        
+        val isMovie = !url.contains("/series/")
+
+        if (isMovie) {
+            return newMovieLoadResponse(title, url, TvType.Movie, url) {
+                this.posterUrl = posterUrl
+                this.plot = plot
+                this.year = year
+            }
+        } else {
+            val episodes = mutableListOf<Episode>()
+            val seasonElements = document.select("div.List--Seasons--Episodes a.SeasonsEpisodes")
+
+            if (seasonElements.isNotEmpty()) {
+                seasonElements.apmap { seasonEl ->
+                    val seasonNum = Regex("الموسم (\\d+)").find(seasonEl.text())?.groupValues?.get(1)?.toIntOrNull()
+                    val dataId = seasonEl.attr("data-id")
+                    val dataSeason = seasonEl.attr("data-season")
+
+                    val seasonPage = app.post(
+                        "$mainUrl/ajax/Episode",
+                        data = mapOf("post_id" to dataId, "season" to dataSeason)
+                    ).document
+
+                    seasonPage.select("a.hoverable.activable").forEach { epEl ->
+                        val epTitle = epEl.selectFirst("episodetitle")?.text() ?: ""
+                        val epNum = Regex("الحلقة (\\d+)").find(epTitle)?.groupValues?.get(1)?.toIntOrNull()
+                        val epHref = epEl.attr("href")
+                        episodes.add(
+                            newEpisode(
+                    data = epHref
+                ) {
+                    name = epTitle
+                    this.season = seasonNum
+                    this.episode = epNum
+                        )
+                    }
+                }
+            } else {
+                 document.select(".EpisodesList.Full--Width a").forEach { epEl ->
+                    val epTitle = epEl.selectFirst("episodetitle")?.text() ?: ""
+                    val epNum = Regex("الحلقة (\\d+)").find(epTitle)?.groupValues?.get(1)?.toIntOrNull()
+                    val epHref = epEl.attr("href")
+                    episodes.add(
+                        newEpisode(
+                    data = epHref
+                ) {
+                    name = epTitle
+                    this.season = 1
+                    this.episode = epNum
+                }
+                    )
+                }
+            }
+            
+            return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes.sortedBy { it.episode }) {
+                this.posterUrl = posterUrl
+                this.plot = plot
+                this.year = year
+            }
+        }
+    }
+    
+    override suspend fun loadLinks(
+        data: String,
+        isCasting: Boolean,
+        subtitleCallback: (SubtitleFile) -> Unit,
+        callback: (ExtractorLink) -> Unit
+    ): Boolean {
+        val document = app.get(data).document
+        
+        document.select("ul.WatchServersList li btn").forEach {
+            val encodedUrl = it.attr("data-url")
+            // Wecima uses a slightly non-standard Base64 encoding.
+            // It replaces some characters. Let's fix them before decoding.
+            val fixedEncodedUrl = encodedUrl.replace(" ", "+").replace("+", " ")
+                .replace(" ", "/")
+                .replace(" ", "=")
+            try {
+                val decodedUrl = String(Base64.decode(fixedEncodedUrl, Base64.DEFAULT))
+                if (decodedUrl.startsWith("http")) {
+                   loadExtractor(decodedUrl, mainUrl, subtitleCallback, callback)
+                }
+            } catch (e: Exception) {
+                logError(e)
+            }
+        }
+        return true
     }
 }
