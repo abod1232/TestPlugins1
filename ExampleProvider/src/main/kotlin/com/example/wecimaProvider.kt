@@ -1,148 +1,173 @@
-package com.wecima // تم تصحيح اسم الحزمة
-
+package com.arabseed
+import android.util.Log
 import com.lagradost.cloudstream3.*
 import com.lagradost.cloudstream3.utils.*
-import org.jsoup.nodes.Element
-import com.lagradost.cloudstream3.network.post
-import com.fasterxml.jackson.annotation.JsonProperty
-import android.util.Base64
-
-class WecimaProvider : MainAPI() {
-    override var mainUrl = "https://wecima.ac"
-    override var name = "We Cima"
-    override val hasMainPage = true
+import org.jsoup.Jsoup
+import com.lagradost.cloudstream3.network.CloudflareKiller
+import com.lagradost.cloudstream3.utils.Qualities
+import kotlinx.serialization.Serializable
+import com.lagradost.cloudstream3.MainAPI
+import com.lagradost.cloudstream3.TvType
+import com.lagradost.cloudstream3.utils.ExtractorLink
+class Arabseed : MainAPI() {
+    override var mainUrl = "https://a.asd.homes"
+    override var name = "Arabseed"
     override var lang = "ar"
-    override val supportedTypes = setOf(
-        TvType.Movie,
-        TvType.TvSeries
-    )
-
-    override val mainPage = mainPageOf(
-        "$mainUrl/seriestv" to "أحدث المسلسلات",
-        "$mainUrl/movies" to "أحدث الأفلام",
-        "$mainUrl/category/arabic-movies" to "أفلام عربي",
-        "$mainUrl/category/foreign-movies" to "أفلام أجنبي",
-        "$mainUrl/category/arabic-series" to "مسلسلات عربية",
-        "$mainUrl/category/foreign-series" to "مسلسلات أجنبية"
-    )
-
-    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
-        val document = app.get(request.data).document
-        val home = document.select("div.Grid--WecimaPosts div.GridItem").mapNotNull {
-            it.toSearchResult()
-        }
-        return newHomePageResponse(request.name, home)
-    }
-
-    private fun Element.toSearchResult(): SearchResponse? {
-        val titleElement = this.selectFirst("h2") ?: this.selectFirst("strong") ?: return null
-        val title = titleElement.text().trim()
-        val href = this.selectFirst("a")?.attr("href") ?: return null
-        val posterUrl = this.selectFirst("span.BG--GridItem")?.let {
-            val style = it.attr("style")
-            Regex("url\\((.*?)\\)").find(style)?.groupValues?.get(1)
-        } ?: this.selectFirst("span.BG--GridItem")?.attr("data-src")
-
-        return if (href.contains("/series/")) {
-            newTvSeriesSearchResponse(title, href, TvType.TvSeries) {
-                this.posterUrl = posterUrl
-            }
-        } else {
-            newMovieSearchResponse(title, href, TvType.Movie) {
-                this.posterUrl = posterUrl
-            }
+    override val hasMainPage = true
+    override val supportedTypes = setOf(TvType.Movie, TvType.TvSeries, TvType.Anime)
+    private fun String.toAbsolute(): String {
+        if (this.isBlank()) return ""
+        return when {
+            this.startsWith("http") -> this
+            this.startsWith("//") -> "https:$this"
+            else -> mainUrl.trimEnd('/') + this
         }
     }
 
     override suspend fun search(query: String): List<SearchResponse> {
-        val url = "$mainUrl/search"
-        val response = app.post(
-            url,
-            data = mapOf("q" to query),
-            referer = "$mainUrl/"
-        ).parsed<SearchRoot>()
+        val url = "$mainUrl/find/?word=${query.trim().replace(" ", "+")}"
+        val document = app.get(url).document
+        return document.select("ul.blocks__ul > li").amap {
+            val a = it.selectFirst("a.movie__block") ?: return@amap null
+            val href = a.attr("href").toAbsolute()
+            val title = a.attr("title").ifBlank { a.selectFirst("h3")?.text() } ?: return@amap null
+            val posterUrl = a.selectFirst("img")?.let { img ->
+                (img.attr("data-src").ifBlank { img.attr("src") }).toAbsolute()
+            }
+            val isMovie = href.contains("/%d9%81%d9%8a%d9%84%d9%85-")
+            val tvType = if (isMovie) TvType.Movie else TvType.TvSeries
 
-        val html = response.output.joinToString("")
-        val document = org.jsoup.Jsoup.parse(html)
-
-        return document.select("div.GridItem").mapNotNull {
-            it.toSearchResult()
-        }
+            newMovieSearchResponse(title, href, tvType) {
+                this.posterUrl = posterUrl
+            }
+        }.filterNotNull()
     }
 
-    data class SearchRoot (
-        @JsonProperty("output" ) val output : ArrayList<String> = arrayListOf()
+    override val mainPage = mainPageOf(
+        "$mainUrl/main0/" to "الرئيسية",
+        "$mainUrl/main0/" to "الرئيسية",
+        "$mainUrl/recently/" to "مضاف حديثا",
+        "$mainUrl/movies/" to "أفلام",
+        "$mainUrl/main0/" to "المسلسلات",
+        "$mainUrl/category/افلام-انيميشن/" to "افلام انيميشن",
+        "$mainUrl/category/cartoon-series/" to "مسلسلات كرتون",
+        "$mainUrl/category/arabic-series-2/" to "مسلسلات عربي",
+        "$mainUrl/category/arabic-movies-6/" to "افلام عربي",
+
+    )
+
+    override suspend fun getMainPage(page: Int, request: MainPageRequest): HomePageResponse {
+        val url = if (page > 1) "${request.data}page/$page/" else request.data
+        val document = app.get(url).document
+        val items = document.select(".movie__block").amap {
+            val title = it.selectFirst("h3")?.text() ?: return@amap null
+            val href = it.attr("href").toAbsolute()
+            val posterUrl = it.selectFirst("img")?.let { img ->
+                (img.attr("data-src").ifBlank { img.attr("src") }).toAbsolute()
+            }
+            newMovieSearchResponse(title, href, TvType.Movie) {
+                this.posterUrl = posterUrl
+            }
+        }.filterNotNull()
+        return newHomePageResponse(request.name, items)
+    }
+
+    @Serializable
+    data class AjaxResponse(
+        val html: String?,
+        val hasmore: Boolean?
     )
 
     override suspend fun load(url: String): LoadResponse {
-        val document = app.get(url).document
+        val doc = app.get(url).document
+        val title = doc.selectFirst("h1.post__name")?.text()?.trim() ?: "غير معروف"
+        val poster = doc.selectFirst(".poster__side img, .single__cover img, .post__poster img")?.let { img ->
+            (img.attr("data-src").ifBlank { img.attr("src") }).toAbsolute()
+        }
+        val synopsis = doc.selectFirst(".post__story > p")?.text()?.trim()
 
-        val title = document.selectFirst("div.Title--Content--Single-begin h1")?.text()?.trim() ?: ""
-        val posterStyle = document.selectFirst("wecima.separated--top")?.attr("style")
-        val posterUrl = Regex("url\\((.*?)\\)").find(posterStyle ?: "")?.groupValues?.get(1)
-        val plot = document.selectFirst("div.StoryMovieContent")?.text()?.trim()
-        val year = document.select("ul.Terms--Content--Single-begin li")
-            .find { it.selectFirst("span")?.text()?.contains("السنة") == true }
-            ?.selectFirst("p")?.text()?.toIntOrNull()
+        val episodes = mutableListOf<Episode>()
 
-        val isMovie = !url.contains("/series/")
+        doc.select("ul.episodes__list li a").forEach { epEl ->
+            val epHref = epEl.attr("href").toAbsolute()
+            val epTitle = epEl.selectFirst(".epi__num")?.text()?.trim() ?: epEl.text().trim()
+            val epNum = epTitle.let { Regex("""\d+""").find(it)?.value?.toIntOrNull() }
+            episodes.add(newEpisode(epHref) {
+                name = epTitle
+                episode = epNum
+                posterUrl = poster
+            })
+        }
 
-        if (isMovie) {
-            return newMovieLoadResponse(title, url, TvType.Movie, url) {
-                this.posterUrl = posterUrl
-                this.plot = plot
-                this.year = year
-            }
-        } else {
-            val episodes = mutableListOf<Episode>()
-            val seasonElements = document.select("div.List--Seasons--Episodes a.SeasonsEpisodes")
+        doc.selectFirst("div.load__more__episodes")?.let { loadMoreButton ->
+            val seasonId = loadMoreButton.attr("data-id")
+            val csrfToken = doc.select("script").html()
+                .let { Regex("""'csrf__token':\s*"([^"]+)""").find(it)?.groupValues?.get(1) }
 
-            if (seasonElements.isNotEmpty()) {
-                seasonElements.apmap { seasonEl ->
-                    val seasonNum = Regex("الموسم (\\d+)").find(seasonEl.text())?.groupValues?.get(1)?.toIntOrNull()
-                    val dataId = seasonEl.attr("data-id")
-                    val dataSeason = seasonEl.attr("data-season")
+            if (seasonId.isNotBlank() && !csrfToken.isNullOrBlank()) {
+                var hasMore = true
+                while (hasMore) {
+                    try {
+                        val response = app.post(
+                            "$mainUrl/season__episodes/",
+                            data = mapOf(
+                                "season_id" to seasonId,
+                                "offset" to episodes.size.toString(),
+                                "csrf_token" to csrfToken
+                            ),
+                            referer = url,
+                            headers = mapOf("X-Requested-With" to "XMLHttpRequest")
+                        ).parsedSafe<AjaxResponse>()
 
-                    val seasonPage = app.post(
-                        "$mainUrl/ajax/Episode",
-                        data = mapOf("post_id" to dataId, "season" to dataSeason)
-                    ).document
+                        if (response?.html.isNullOrBlank() || response?.hasmore != true) {
+                            hasMore = false
+                        } else {
+                            val newEpisodesDoc = Jsoup.parse(response.html)
+                            val newEpisodeElements = newEpisodesDoc.select("li a")
 
-                    seasonPage.select("a.hoverable.activable").forEach { epEl ->
-                        val epTitle = epEl.selectFirst("episodetitle")?.text() ?: ""
-                        val epNum = Regex("الحلقة (\\d+)").find(epTitle)?.groupValues?.get(1)?.toIntOrNull()
-                        val epHref = epEl.attr("href")
-                        episodes.add(
-                            newEpisode(epHref) {
-                                name = epTitle
-                                season = seasonNum
-                                episode = epNum
+                            if (newEpisodeElements.isEmpty()) {
+                                hasMore = false
+                            } else {
+                                newEpisodeElements.forEach { epEl ->
+                                    val epHref = epEl.attr("href").toAbsolute()
+                                    val epTitle = epEl.selectFirst(".epi__num")?.text()?.trim()
+                                        ?: epEl.text().trim()
+                                    val epNum =
+                                        epTitle.let { Regex("""\d+""").find(it)?.value?.toIntOrNull() }
+
+                                    episodes.add(newEpisode(epHref) {
+                                        name = epTitle
+                                        episode = epNum
+                                        posterUrl = poster
+                                    })
+                                }
                             }
-                        )
+                        }
+                    } catch (e: Exception) {
+                        Log.e(name, "AJAX load more error", e)
+                        hasMore = false
                     }
                 }
-            } else {
-                 document.select(".EpisodesList.Full--Width a").forEach { epEl ->
-                    val epTitle = epEl.selectFirst("episodetitle")?.text() ?: ""
-                    val epNum = Regex("الحلقة (\\d+)").find(epTitle)?.groupValues?.get(1)?.toIntOrNull()
-                    val epHref = epEl.attr("href")
-                    episodes.add(
-                        newEpisode(epHref) {
-                            name = epTitle
-                            season = 1 // Default to season 1
-                            episode = epNum
-                        }
-                    )
-                }
             }
+        }
 
-            return newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes.sortedBy { it.episode }) {
-                this.posterUrl = posterUrl
-                this.plot = plot
-                this.year = year
+        val isTvSeries = episodes.isNotEmpty() || url.contains("/selary/")
+
+        return if (isTvSeries) {
+            newTvSeriesLoadResponse(title, url, TvType.TvSeries, episodes.distinct().reversed()) {
+                this.posterUrl = poster
+                this.plot = synopsis
+            }
+        } else {
+            newMovieLoadResponse(title, url, TvType.Movie, url) {
+                this.posterUrl = poster
+                this.plot = synopsis
             }
         }
     }
+
+    @Serializable
+    data class ServerResponse(val server: String?)
 
     override suspend fun loadLinks(
         data: String,
@@ -150,22 +175,84 @@ class WecimaProvider : MainAPI() {
         subtitleCallback: (SubtitleFile) -> Unit,
         callback: (ExtractorLink) -> Unit
     ): Boolean {
-        val document = app.get(data).document
+        Log.i(name, "loadLinks initiated with data: $data")
 
-        document.select("ul.WatchServersList li btn").apmap {
-            val encodedUrl = it.attr("data-url")
-            // Wecima's Base64 is a bit weird, manually fix it.
-            val fixedEncodedUrl = encodedUrl.replace(" ", "+")
-            try {
-                // The URL is plain Base64, but needs decoding.
-                val decodedUrl = String(Base64.decode(fixedEncodedUrl, Base64.DEFAULT))
-                if (decodedUrl.startsWith("http")) {
-                   loadExtractor(decodedUrl, mainUrl, subtitleCallback, callback)
+        val episodePageDoc = app.get(data).document
+        val watchUrl = episodePageDoc.selectFirst("a.btton.watch__btn")?.attr("href")?.toAbsolute()
+            ?: run {
+                Log.e(name, "Failed to find the watch button URL on: $data")
+                return false
+            }
+        Log.d(name, "Found watch URL: $watchUrl")
+
+        val watchPageDoc = app.get(watchUrl, referer = data).document
+
+        val csrfToken = watchPageDoc.select("script").html()
+            .let { Regex("""'csrf__token':\s*"([^"]+)""").find(it)?.groupValues?.get(1) }
+            ?: return true
+        val postId = watchPageDoc.selectFirst(".servers__list li")?.attr("data-post") ?: return true
+
+        watchPageDoc.select(".quality__swither ul.qualities__list li").amap { qualityElement ->
+            val quality = qualityElement.attr("data-quality")
+            Log.i(name, "Processing AJAX quality: '$quality'")
+
+            app.post(
+                "$mainUrl/get__quality__servers/",
+                data = mapOf("post_id" to postId, "quality" to quality, "csrf_token" to csrfToken),
+                referer = watchUrl,
+                headers = mapOf("X-Requested-With" to "XMLHttpRequest")
+            ).parsedSafe<AjaxResponse>()?.html?.let { html ->
+                Jsoup.parse(html).select("li").amap { serverElement ->
+                    val serverId = serverElement.attr("data-server")
+                    val postData = mapOf("post_id" to postId, "quality" to quality, "server" to serverId, "csrf_token" to csrfToken)
+
+                    try {
+                        if (serverId == "0") {
+                            Log.d(name, "->>>>>> [Server 0] Attempting to fetch. Quality: '$quality'. Data: $postData")
+                        }
+
+                        val response = app.post(
+                            "$mainUrl/get__watch__server/",
+                            data = postData,
+                            referer = watchUrl,
+                            headers = mapOf("X-Requested-With" to "XMLHttpRequest")
+                        )
+
+                        if (serverId == "0") {
+                            Log.d(name, "<<<<<<- [Server 0] Raw response text: ${response.text}")
+                        }
+
+                        val serverResponse = response.parsedSafe<ServerResponse>()
+
+                        if (serverId == "0") {
+                            Log.d(name, "[Server 0] Parsed response object: $serverResponse")
+                        }
+
+
+                        serverResponse?.server?.let { iframeUrl ->
+                            if(iframeUrl.isNotBlank()) {
+                                if (serverId == "0") {
+                                    Log.d(name, "[Server 0] Successfully extracted iframe URL: $iframeUrl")
+                                }
+                                loadExtractor(iframeUrl, watchUrl, subtitleCallback, callback)
+                            } else {
+                                if (serverId == "0") {
+                                    Log.w(name, "[Server 0] Iframe URL is blank in the response.")
+                                }
+                            }
+                        } ?: run {
+                            if (serverId == "0") {
+                                Log.w(name, "[Server 0] Failed to parse a valid ServerResponse object or the 'server' field was null.")
+                            }
+                        }
+                    } catch (e: Exception) {
+                        Log.e(name, "Exception on AJAX server ID '$serverId'", e)
+                    }
                 }
-            } catch (e: Exception) {
-                logError(e)
             }
         }
+
+        Log.i(name, "loadLinks has finished processing all servers.")
         return true
     }
 }
