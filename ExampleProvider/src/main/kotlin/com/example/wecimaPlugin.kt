@@ -1,12 +1,16 @@
-package com.wecima
+package com.arabseed
 
+import android.content.Context
 import com.lagradost.cloudstream3.plugins.CloudstreamPlugin
 import com.lagradost.cloudstream3.plugins.Plugin
-import android.content.Context
 
 @CloudstreamPlugin
-class CimaClubPlugin: Plugin() {
+class ArabseedProvider : Plugin() {
     override fun load(context: Context) {
-        registerMainAPI(WecimaProvider())
+        // تسجيل مزود ArabSeed
+        registerMainAPI(Arabseed())
+        registerExtractorAPI(GameHubExtractor())
+
+
     }
 }
